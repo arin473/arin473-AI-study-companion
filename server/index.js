@@ -33,7 +33,11 @@ dotenv.config({ path: path.join(rootDir, '.env') });
 dotenv.config({ path: path.join(rootDir, '.env.local') });
 
 const app = express();
-const PORT = process.env.PORT || 301;
+// Default port MUST match vite.config.js proxy target (localhost:3001) so
+// `npm run server` + `vite` in separate terminals works without ECONNREFUSED.
+// server/dev.js also spawns the backend with PORT=3001. (Vercel ignores this;
+// the listen() call below is skipped when process.env.VERCEL is set.)
+const PORT = process.env.PORT || 3001;
 
 // Middleware FIRST — before any routes, so every /api/* response (including
 // errors) gets CORS headers and JSON body parsing. Previously cors()/json()
