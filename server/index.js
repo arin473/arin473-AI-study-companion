@@ -28,11 +28,7 @@ dotenv.config({ path: path.join(rootDir, '.env') });
 dotenv.config({ path: path.join(rootDir, '.env.local') });
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Gemini API client (server-side only)
-const geminiApiKey = process.env.GEMINI_API_KEY || '';
-const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+const PORT = process.env.PORT || 301;
 
 // Vercel Blob configuration
 // The BLOB_TOKEN is set as a Vercel environment secret (not exposed to browsers).
@@ -153,75 +149,83 @@ app.post('/api/upload', async (req, res) => {
       fileContent = null;
     }
 
-    if (geminiApiKey && ai && !isLegacyPpt) {
+    if (!isLegacyPpt) {
       try {
-        // Upload to Gemini File API using the file content from Blob
-        // The @google/genai SDK v2 accepts Blob, ArrayBuffer, ReadableStream, or string path
-        let geminiFileObj;
-        if (fileContent instanceof ArrayBuffer || (fileContent !== null && typeof fileContent === 'object')) {
-          // Pass the ArrayBuffer/Blob directly
-          geminiFileObj = await ai.files.upload({
-            file: fileContent,
-            config: {
-              displayName: originalName,
-              mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
-            }
-          });
-        } else {
-          // Fallback: try passing as-is
-          geminiFileObj = await ai.files.upload({
-            file: fileContent,
-            config: {
-              displayName: originalName,
-              mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
-            }
-          });
-        }
-        geminiFile = geminiFileObj;
-        console.log(`[GeminiBackend] File uploaded to Gemini: ${geminiFile.name}, initial state: ${geminiFile.state}`);
-
-        // For video files, poll until ACTIVE
-        const effectiveMime = mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4');
-        if (effectiveMime.startsWith('video/')) {
-          let attempts = 0;
-          const MAX_POLL = 30; // ~2 minutes maximum
-          while (attempts < MAX_POLL) {
-            const state = geminiFile.state?.toString();
-            if (state === 'ACTIVE') break;
-            if (state === 'FAILED') {
-              throw new Error('Gemini File API video processing failed.');
-            }
-            await new Promise(r => setTimeout(r, 4000));
-            geminiFile = await ai.files.get({ name: geminiFile.name });
-            attempts++;
-          }
-          if (geminiFile.state?.toString() !== 'ACTIVE') {
-            throw new Error('Video processing timed out. Try a shorter clip or check your network.');
-          }
-        }
-
-        // Non-blocking: extract and save full text for tutor source-grounding context
+        // Initialize GoogleGenAI client for this request
+        const googleGenAi = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
         try {
-          await ai.models.generateContent({
-            model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-            contents: [{
-              role: 'user',
-              parts: [
-                { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
-                { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
-              ]
-            }]
-          }).catch(e =>
-            console.warn('[Server] extractFullText non-blocking skipped:', e.message)
-          );
-        } catch (extractErr) {
-          console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
-        }
+          // Upload to Gemini File API using the file content from Blob
+          // The @google/genai SDK v2 accepts Blob, ArrayBuffer, ReadableStream, or string path
+          let geminiFileObj;
+          if (fileContent instanceof ArrayBuffer || (fileContent !== null && typeof fileContent === 'object')) {
+            // Pass the ArrayBuffer/Blob directly
+            geminiFileObj = await googleGenAi.files.upload({
+              file: fileContent,
+              config: {
+                displayName: originalName,
+                mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
+              }
+            });
+          } else {
+            // Fallback: try passing as-is
+            geminiFileObj = await googleGenAi.files.upload({
+              file: fileContent,
+              config: {
+                displayName: originalName,
+                mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
+              }
+            });
+          }
+          geminiFile = geminiFileObj;
+          console.log(`[GeminiBackend] File uploaded to Gemini: ${geminiFile.name}, initial state: ${geminiFile.state}`);
 
-        analysisResult = await geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName);
-      } catch (geminiErr) {
-        console.warn('[Server] Gemini processing warning:', geminiErr.message);
-        // Continue with limited metadata if Gemini processing fails
+          // For video files, poll until ACTIVE
+          const effectiveMime = mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4');
+          if (effectiveMime.startsWith('video/')) {
+            let attempts = 0;
+            const MAX_POLL = 30; // ~2 minutes maximum
+            while (attempts < MAX_POLL) {
+              const state = geminiFile.state?.toString();
+              if (state === 'ACTIVE') break;
+              if (state === 'FAILED') {
+                throw new Error('Gemini File API video processing failed.');
+              }
+              await new Promise(r => setTimeout(r, 4000));
+              geminiFile = await googleGenAi.files.get({ name: geminiFile.name });
+              attempts++;
+            }
+            if (geminiFile.state?.toString() !== 'ACTIVE') {
+              throw new Error('Video processing timed out. Try a shorter clip or check your network.');
+            }
+          }
+
+          // Non-blocking: extract and save full text for tutor source-grounding context
+          try {
+            await googleGenAi.models.generateContent({
+              model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
+                  { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
+                ]
+              }]).catch(e =>
+                console.warn('[Server] extractFullText non-blocking skipped:', e.message)
+              );
+          } catch (extractErr) {
+            console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
+          }
+
+          analysisResult = await geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName);
+        } catch (err) {
+          console.error('[Server] Gemini upload error:', err);
+          res.status(500).json({ ok: false, error: err.message || 'File processing failed.' });
+          return;
+        }
+      } catch (err) {
+        console.error('[Server] Gemini initialization error:', err);
+        res.status(500).json({ ok: false, error: err.message || 'Gemini API initialization failed.' });
+        return;
       }
     } else if (isLegacyPpt) {
       console.log('[Server] .ppt (legacy binary) is not supported by Gemini File API. Indexing as text-only. Suggest converting to .pptx.');
@@ -245,7 +249,7 @@ app.post('/api/upload', async (req, res) => {
       statusStr = 'Processed (100% - Gemini Multimodal)';
     } else if (isLegacyPpt) {
       statusStr = 'Indexed (Text-only — convert to .pptx for Gemini vision)';
-    } else if (geminiApiKey && ai) {
+    } else if (process.env.GEMINI_API_KEY && googleGenAi) {
       statusStr = 'Indexed (Gemini processing failed — check server logs)';
     } else {
       statusStr = 'Indexed (Local Knowledge Engine — set GEMINI_API_KEY for live AI)';
@@ -363,7 +367,7 @@ app.get('/api/evaluate-rag', async (req, res) => {
     res.json({ ok: true, data: evaluationResults });
   } catch (err) {
     console.error('[Server] RAG evaluation error:', err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, data: err.message });
   }
 });
 
@@ -390,7 +394,6 @@ app.listen(PORT, () => {
   console.log(`🚀 AI Study Companion API Backend is Running!`);
   console.log(`📡 Port: ${PORT} (API at http://localhost:${PORT}/api)`);
   console.log(`🔑 Gemini API Key: ${geminiService.isConfigured() ? 'Configured ✅' : 'Not Set (Running in Grounded Core Mode) ⚠️'}`);
-  console.log(`📁 Uploads Directory: ${uploadsDir}`);
   console.log(`======================================================\n`);
 });
 }
