@@ -107,9 +107,7 @@ export default function MultimodalUpload({
     // This bypasses server function payload limits - the transfer goes
     // directly from browser to Vercel's edge storage
     try {
-      const fetchModule = await import('fetch');
-      const fetch = fetchModule.default || fetchModule.fetch;
-      
+      // fetch is available globally in Node.js 18+ (project uses ESM)
       // Use the Vercel Blob upload API with the signed URL
       // The signed URL from /api/blob-upload-url includes the token and path
       const blobResponse = await fetch(signedBlobUrl, {
