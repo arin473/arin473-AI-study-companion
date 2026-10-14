@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '../../context/LanguageContext';
 import { GeminiService } from '../../services/geminiService';
+import { upload as uploadToVercelBlob } from '@vercel/blob/client';
 
 export default function MultimodalUpload({ 
   activeCourse, 
@@ -57,20 +58,73 @@ export default function MultimodalUpload({
     }
   };
 
-  // Generate a signed Vercel Blob upload URL
+  // Generate a signed Vercel Blob upload URL (legacy direct-PUT flow).
+  // Kept as a fallback for local dev; production uses the documented
+  // @vercel/blob/client upload() flow via POST /api/blob-upload instead.
   const generateBlobUploadUrl = async () => {
     try {
       const res = await fetch('/api/blob-upload-url');
-      const data = await res.json();
-      if (data.ok && data.blobUrl) {
+      const rawText = await res.text();
+      let data;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        // Server returned HTML instead of JSON — surface the real cause.
+        console.error('[MultimodalUpload] /api/blob-upload-url returned non-JSON:', rawText.slice(0, 200));
+        throw new Error(`Upload service returned an invalid response (HTTP ${res.status}). The API route may be misconfigured — check Vercel Function Logs for [API] entries.`);
+      }
+      if (!res.ok || !data.ok) {
+        throw new Error(data?.error || `Failed to generate Blob upload URL (HTTP ${res.status})`);
+      }
+      if (data.blobUrl) {
         setBlobUrl(data.blobUrl);
         return data.blobUrl;
       }
       throw new Error('Failed to generate Blob upload URL');
     } catch (err) {
       console.error('[MultimodalUpload] Blob upload URL error:', err);
-      setUploadError('Failed to prepare upload. Please try again.');
+      setUploadError(err.message || 'Failed to prepare upload. Please try again.');
       return null;
+    }
+  };
+
+  // Upload a file directly to Vercel Blob from the browser.
+  // Primary: documented SDK flow — upload() exchanges a client token with
+  // POST /api/blob-upload, then streams the file straight to Blob storage
+  // (bypasses server function payload limits). Returns the public Blob URL.
+  // Fallback: legacy GET /api/blob-upload-url + PUT flow (local dev).
+  const uploadFileToBlob = async (file) => {
+    try {
+      const blob = await uploadToVercelBlob(file.name, file, {
+        access: 'public',
+        handleUploadUrl: '/api/blob-upload',
+        contentType: file.type || 'application/octet-stream'
+      });
+      if (blob?.url) {
+        setBlobUrl(blob.url);
+        return blob.url;
+      }
+      throw new Error('Blob SDK upload returned no URL');
+    } catch (sdkErr) {
+      console.warn('[MultimodalUpload] SDK upload failed, trying legacy PUT flow:', sdkErr.message);
+      const signedBlobUrl = await generateBlobUploadUrl();
+      if (!signedBlobUrl) {
+        // generateBlobUploadUrl already set the upload error message
+        throw new Error('Blob upload unavailable. Set BLOB_READ_WRITE_TOKEN or VERCEL_BLOB_TOKEN in Vercel.');
+      }
+      const blobResponse = await fetch(signedBlobUrl, {
+        method: 'PUT',
+        body: file,
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream'
+        }
+      });
+
+      if (!blobResponse.ok) {
+        const errorText = await blobResponse.text().catch(() => 'Unknown error');
+        throw new Error(`Vercel Blob upload failed: ${blobResponse.status} - ${errorText}`);
+      }
+      return signedBlobUrl;
     }
   };
 
@@ -96,37 +150,31 @@ export default function MultimodalUpload({
       ? `"${file.name}" अपलोड किया जा रहा है...` 
       : `Uploading "${file.name}" to Vercel Blob storage...`);
 
-    // Generate signed Blob upload URL
-    const signedBlobUrl = await generateBlobUploadUrl();
-    if (!signedBlobUrl) {
+    // Upload the file directly to Vercel Blob from the browser.
+    // Primary flow: documented @vercel/blob/client SDK (token exchange with
+    // POST /api/blob-upload). Fallback: legacy signed-URL PUT (local dev).
+    // Either way the bytes go browser -> Blob edge storage, bypassing server
+    // function payload limits.
+    let finalBlobUrl;
+    try {
+      finalBlobUrl = await uploadFileToBlob(file);
+    } catch (blobErr) {
+      // uploadFileToBlob / generateBlobUploadUrl already set uploadError
+      console.error('[MultimodalUpload] Blob upload failed:', blobErr);
       setIsUploading(false);
+      setUploadProgress(0);
+      setUploadStage('');
+      if (!uploadError) {
+        setUploadError(blobErr.message || 'Blob upload failed. Please try again.');
+      }
       return;
     }
 
-    // Upload file directly to Vercel Blob from the browser
-    // This bypasses server function payload limits - the transfer goes
-    // directly from browser to Vercel's edge storage
+    // Blob upload succeeded - now call the backend API with the Blob URL + metadata
     try {
-      // fetch is available globally in Node.js 18+ (project uses ESM)
-      // Use the Vercel Blob upload API with the signed URL
-      // The signed URL from /api/blob-upload-url includes the token and path
-      const blobResponse = await fetch(signedBlobUrl, {
-        method: 'PUT',
-        body: file,
-        headers: {
-          'Content-Type': file.type || 'application/octet-stream'
-        }
-      });
-
-      if (!blobResponse.ok) {
-        const errorText = await blobResponse.text().catch(() => 'Unknown error');
-        throw new Error(`Vercel Blob upload failed: ${blobResponse.status} - ${errorText}`);
-      }
-
-      // Blob upload succeeded - now call the backend API with the Blob URL + metadata
       setUploadProgress(20);
-      setUploadStage(isHindi 
-        ? 'बैकएंड पर संसाधन प्रसंस्करण शुरू हो रहा है...' 
+      setUploadStage(isHindi
+        ? 'बैकएंड पर संसाधन प्रसंस्करण शुरू हो रहा है...'
         : 'Blob uploaded, starting backend processing...');
 
       const response = await fetch('/api/upload', {
@@ -135,16 +183,13 @@ export default function MultimodalUpload({
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          blobUrl: signedBlobUrl,
+          blobUrl: finalBlobUrl,
           courseId: activeCourse?.id,
           fileType: targetFileType,
           originalName: file.name,
           mimeType: file.type || 'application/octet-stream'
         })
       });
-
-      clearTimeout(progressTimer1);
-      clearTimeout(progressTimer2);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -177,8 +222,6 @@ export default function MultimodalUpload({
 
     } catch (err) {
       console.error('File ingestion error:', err);
-      clearTimeout(progressTimer1);
-      clearTimeout(progressTimer2);
       setIsUploading(false);
       setUploadProgress(0);
       setUploadStage('');

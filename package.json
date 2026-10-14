@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.25.0",
+    "@vercel/blob": "^2.8.2",
     "clsx": "^2.1.1",
     "cors": "^2.8.6",
     "dotenv": "^18.0.5",

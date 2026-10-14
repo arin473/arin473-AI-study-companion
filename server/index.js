@@ -35,6 +35,20 @@ dotenv.config({ path: path.join(rootDir, '.env.local') });
 const app = express();
 const PORT = process.env.PORT || 301;
 
+// Middleware FIRST — before any routes, so every /api/* response (including
+// errors) gets CORS headers and JSON body parsing. Previously cors()/json()
+// were registered AFTER /api/blob-upload-url, so that route missed them.
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request logging — critical for diagnosing Vercel production issues via
+// Runtime/Function Logs (filter by "[API]").
+app.use((req, res, next) => {
+  console.log(`[API] ${req.method} ${req.url}`);
+  next();
+});
+
 // Vercel Blob token — read from environment (Vercel secret or .env file).
 // Used to generate signed upload URLs for direct browser→Blob uploads.
 // Do NOT expose this to the browser; it authorizes server-side Blob writes.
@@ -42,7 +56,10 @@ const PORT = process.env.PORT || 301;
 // NEVER process.exit(), which would crash the serverless function during
 // initialization and cause Vercel to return an HTML 500 error page
 // (the exact "Unexpected token '<', \"<!DOCTYPE" symptom on the frontend).
-const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
+const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN || process.env.VERCEL_BLOB_TOKEN || '';
+const BLOB_TOKEN_VAR_NAME = process.env.BLOB_READ_WRITE_TOKEN
+  ? 'BLOB_READ_WRITE_TOKEN'
+  : (process.env.VERCEL_BLOB_TOKEN ? 'VERCEL_BLOB_TOKEN' : '(missing: set BLOB_READ_WRITE_TOKEN or VERCEL_BLOB_TOKEN)');
 
 /**
  * Generate a signed Vercel Blob upload URL for direct frontend upload.
@@ -59,10 +76,10 @@ app.get('/api/blob-upload-url', async (req, res) => {
     // Missing token → return JSON (not an HTML 500 page). The frontend
     // surfaces a clear error instead of a JSON parse failure.
     if (!BLOB_TOKEN) {
-      console.error('[Server] /api/blob-upload-url: VERCEL_BLOB_TOKEN is not set in the environment.');
+      console.error('[Server] /api/blob-upload-url: no Blob token found. Checked BLOB_READ_WRITE_TOKEN and VERCEL_BLOB_TOKEN — both missing.');
       return res.status(500).json({
         ok: false,
-        error: 'Vercel Blob token is not configured. Set VERCEL_BLOB_TOKEN as a Vercel environment variable (generate via: vercel blob tokens create <expiry-days>).'
+        error: 'Vercel Blob token is not configured. Set BLOB_READ_WRITE_TOKEN (auto-created when a Blob store is connected) or VERCEL_BLOB_TOKEN (generate via: vercel blob tokens create) as a Vercel environment variable.'
       });
     }
 
@@ -80,7 +97,7 @@ app.get('/api/blob-upload-url', async (req, res) => {
     // this URL; the token in the query string authorizes the write.
     const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${BLOB_TOKEN}`;
 
-    console.log(`[Server] Generated Blob upload URL for path: ${blobPath}`);
+    console.log(`[Server] Generated Blob upload URL for path: ${blobPath} (token from ${BLOB_TOKEN_VAR_NAME})`);
     return res.json({ ok: true, blobUrl: signedUrl, blobPath });
   } catch (err) {
     // NEVER return an HTML error page. Always return JSON so the frontend
@@ -90,6 +107,60 @@ app.get('/api/blob-upload-url', async (req, res) => {
       ok: false,
       error: `Failed to generate Blob upload URL: ${err.message || 'Unknown error'}`
     });
+  }
+});
+
+/**
+ * Vercel Blob client-upload token route (documented SDK flow).
+ * The browser calls upload(filename, file, { handleUploadUrl: '/api/blob-upload' })
+ * from '@vercel/blob/client'; the SDK POSTs token-exchange bodies here and this
+ * route answers via handleUpload(). Requires BLOB_READ_WRITE_TOKEN (auto-created
+ * when a Blob store is connected) or VERCEL_BLOB_TOKEN as fallback.
+ * Accepts PDF (application/pdf), video (video/*), and slides (.pptx MIME).
+ */
+app.post('/api/blob-upload', async (req, res) => {
+  try {
+    if (!BLOB_TOKEN) {
+      console.error('[Server] /api/blob-upload: no Blob token found. Checked BLOB_READ_WRITE_TOKEN and VERCEL_BLOB_TOKEN — both missing.');
+      return res.status(500).json({
+        ok: false,
+        error: 'Vercel Blob token is not configured. Set BLOB_READ_WRITE_TOKEN (auto-created when a Blob store is connected) or VERCEL_BLOB_TOKEN as a Vercel environment variable.'
+      });
+    }
+    // handleUpload reads the token from process.env.BLOB_READ_WRITE_TOKEN by
+    // default; expose our resolved token under that name if only the custom
+    // VERCEL_BLOB_TOKEN is configured.
+    if (!process.env.BLOB_READ_WRITE_TOKEN && process.env.VERCEL_BLOB_TOKEN) {
+      process.env.BLOB_READ_WRITE_TOKEN = process.env.VERCEL_BLOB_TOKEN;
+    }
+    const { handleUpload } = await import('@vercel/blob/client');
+    const body = req.body;
+    const jsonResponse = await handleUpload({
+      body,
+      request: req,
+      onBeforeGenerateToken: async (pathname) => {
+        console.log(`[Server] Blob client upload token requested for: ${pathname}`);
+        return {
+          allowedContentTypes: [
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'application/vnd.ms-powerpoint',
+            'video/mp4',
+            'video/webm',
+            'video/quicktime',
+            'video/x-matroska'
+          ],
+          addRandomSuffix: true
+        };
+      },
+      onUploadCompleted: async ({ blob }) => {
+        console.log('[Server] Blob client upload completed:', blob.url);
+      }
+    });
+    return res.json(jsonResponse);
+  } catch (err) {
+    console.error('[Server] /api/blob-upload error:', err);
+    return res.status(400).json({ ok: false, error: err.message || 'Blob upload token exchange failed.' });
   }
 });
 
@@ -119,10 +190,6 @@ const upload = multer({
     }
   }
 });
-
-// Middleware
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
 
 const geminiService = new GeminiBackendService();
 
@@ -410,6 +477,14 @@ app.get('/api/evaluate-personalization', (req, res) => {
     console.error('[Server] Personalization evaluation error:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// 404 catch-all for /api/* — MUST return JSON, never Express's default HTML
+// "Cannot GET /api/..." page. Without this, a mis-routed request produces the
+// exact "<!DOCTYPE..." HTML the frontend chokes on.
+app.use('/api', (req, res) => {
+  console.error(`[Server] 404 no API route matched: ${req.method} ${req.url} (originalUrl: ${req.originalUrl})`);
+  res.status(404).json({ ok: false, error: `API route not found: ${req.method} ${req.originalUrl || req.url}` });
 });
 
 // Error handling middleware

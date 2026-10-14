@@ -37,18 +37,20 @@ export const GeminiService = {
    * to Vercel Blob, then the server processes the Blob URL and uploads to Gemini File API.
    */
   async uploadSourceFile({ file, courseId, fileType, blobUrl, originalName, mimeType }) {
-    // Flow 2: Use direct Blob URL upload (new Vercel-compatible architecture)
+    // Flow 2: Use direct Blob URL upload (Vercel-compatible architecture).
+    // The server's /api/upload endpoint parses a JSON body (express.json()),
+    // so send JSON here — NOT multipart FormData.
     if (blobUrl && originalName) {
-      const formData = new FormData();
-      formData.append('blobUrl', blobUrl);
-      formData.append('courseId', courseId || '');
-      formData.append('fileType', fileType || '');
-      formData.append('originalName', originalName);
-      formData.append('mimeType', mimeType || 'application/octet-stream');
-
       const res = await fetch('/api/upload', {
         method: 'POST',
-        body: formData
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          blobUrl,
+          courseId: courseId || '',
+          fileType: fileType || '',
+          originalName,
+          mimeType: mimeType || 'application/octet-stream'
+        })
       });
 
       if (!res.ok) {
