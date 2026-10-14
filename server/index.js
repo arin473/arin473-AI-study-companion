@@ -35,6 +35,11 @@ for (const varName of requiredEnvVars) {
   }
 }
 
+// Vercel Blob configuration
+// The BLOB_TOKEN is set as a Vercel environment secret (not exposed to browsers).
+// It authorizes server-side writes to Vercel Blob storage.
+const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
+
 dotenv.config({ path: path.join(rootDir, '.env') });
 dotenv.config({ path: path.join(rootDir, '.env.local') });
 
@@ -53,24 +58,30 @@ const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
  */
 app.get('/api/blob-upload-url', async (req, res) => {
   try {
-    if (!BLOB_TOKEN) {
+    // Ensure required env vars are present - Vercel will exit the function
+    // if they're missing, so we should never hit this path without them in prod.
+    // But we guard anyway to return proper JSON instead of a 500 HTML error.
+    if (!process.env.VERCEL_BLOB_TOKEN) {
       return res.status(500).json({ ok: false, error: 'Vercel Blob token not configured.' });
     }
 
-    // Vercel Blob upload API: POST to https://blob.vercel-storage.com/upload
-    // We generate a path based on timestamp and original name to avoid collisions
-    const timestamp = Date.now();
-    // Return a signed URL that the frontend can use with PUT/POST
-    const blobPath = `uploads/${timestamp}-${Date.randomUUID()}`;
-    const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${BLOB_TOKEN}`;
+    // Generate a unique path for the Blob upload using a safe UUID fallback.
+    // Date.randomUUID() is Node.js 20+; fall back to a deterministic string
+    // so the endpoint never throws due to runtime version differences.
+    let blobPath;
+    try {
+      blobPath = `uploads/${Date.now()}-${crypto.randomUUID()}`;
+    } catch {
+      blobPath = `uploads/${Date.now()}-${Math.random().toString(36).slice(2, 20)}`;
+    }
 
-    res.json({
-      ok: true,
-      blobUrl: signedUrl,
-      blobPath: blobPath
-    });
+    const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${process.env.VERCEL_BLOB_TOKEN}`;
+
+    // Always return valid JSON — never allow an HTML 500 page to leak to the frontend.
+    res.json({ ok: true, blobUrl: signedUrl, blobPath });
   } catch (err) {
-    console.error('[Server] Blob upload URL error:', err);
+    // Never return an HTML error page. Always return JSON.
+    console.error('[Server] Blob upload URL unexpected error:', err);
     res.status(500).json({ ok: false, error: 'Failed to generate Blob upload URL.' });
   }
 });
