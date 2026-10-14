@@ -78,15 +78,18 @@ export default function MultimodalUpload({
       ? `"${file.name}" अपलोड किया जा रहा है...` 
       : `Uploading "${file.name}" to multimodal ingestion pipeline...`);
 
+    let progressTimer1;
+    let progressTimer2;
+
     try {
-      const progressTimer1 = setTimeout(() => {
+      progressTimer1 = setTimeout(() => {
         setUploadProgress(45);
         setUploadStage(targetFileType === 'video'
           ? (isHindi ? 'जेमिनी वीडियो फ्रेम और टाइमस्टैम्प संसाधित किए जा रहे हैं...' : 'Processing Gemini multimodal video frames & speech timestamps...')
           : (isHindi ? 'जेमिनी विज़न और दस्तावेज़ लेआउट का विश्लेषण किया जा रहा है...' : 'Extracting document layout, formulas & visual coordinates via Gemini...'));
       }, 600);
 
-      const progressTimer2 = setTimeout(() => {
+      progressTimer2 = setTimeout(() => {
         setUploadProgress(80);
         setUploadStage(isHindi 
           ? 'पाठ्यक्रम ज्ञान ग्राफ में उद्धरण और सूत्र इंडेक्स किए जा रहे हैं...' 

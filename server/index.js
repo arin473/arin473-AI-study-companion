@@ -275,6 +275,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, error: err.message || 'Internal server error' });
 });
 
+if(!process.env.VERCEL){
 app.listen(PORT, () => {
   console.log(`\n======================================================`);
   console.log(`🚀 AI Study Companion API Backend is Running!`);
@@ -283,3 +284,6 @@ app.listen(PORT, () => {
   console.log(`📁 Uploads Directory: ${uploadsDir}`);
   console.log(`======================================================\n`);
 });
+}
+
+export default app
