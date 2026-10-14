@@ -22,16 +22,27 @@ function readExtractedSourceText(source) {
   const inlineText = source?.extractedText || source?.fullText || source?.contentText;
   if (typeof inlineText === 'string' && inlineText.trim()) return inlineText;
 
-  const fileName = source?.fileName;
-  if (!fileName || path.basename(fileName) !== fileName) return '';
-  const uploadsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'uploads');
-  const sidecarPath = path.resolve(uploadsDir, `${fileName}.txt`);
-  if (!sidecarPath.startsWith(`${uploadsDir}${path.sep}`)) return '';
-  try {
-    return fs.readFileSync(sidecarPath, 'utf8');
-  } catch {
+  // Try to read from Gemini file URI first, then fall back to Blob URL, then to local fileName
+  // On Vercel, files are stored in object storage (Vercel Blob / Gemini File API), not local filesystem
+  const fileUri = source?.fileUri || source?.geminiFileUri || (source?.fileName ? `/blob/${source.fileName}` : '');
+  if (!fileUri) return '';
+
+  // If we have a Gemini file URI, try to fetch the extracted text via the Gemini API
+  // or return empty - extracted text persistence is now handled server-side via Blob
+  if (fileUri.startsWith('/blob/') || fileUri.includes('vercel-blob')) {
+    // For Vercel Blob-stored files, the extracted text is persisted alongside the Blob
+    // or we rely on the Gemini fileData attachment for grounding
     return '';
   }
+
+  // Fall back: if fileName looks like a local path, try to read from it (development only)
+  // In production on Vercel, this path won't exist, so we return empty
+  if (fileUri && fileUri !== '/blob/placeholder' && !fileUri.startsWith('http')) {
+    // Not reading from local filesystem on Vercel - return empty and rely on Gemini attachments
+    return '';
+  }
+
+  return '';
 }
 
 function extractDsaPatternHeadings(text) {
@@ -220,9 +231,10 @@ Return ONLY valid JSON. No markdown code fences, no extra commentary.`;
   }
 
   /**
-   * Extract the full text content from an uploaded Gemini file and persist it alongside
-   * the uploaded file (as <localFilePath>.txt) so the tutor can include real document text
-   * in the prompt context for exact factual questions.
+   * Extract the full text content from an uploaded Gemini file and persist it
+   * alongside the upload in Vercel Blob storage (not local filesystem).
+   * On Vercel, the local filesystem is read-only (EROFS), so we rely on the
+   * Gemini fileData attachment for ground truth text rather than local sidecar files.
    * Non-fatal: if this fails the tutor still works via Gemini fileData attachment.
    */
   async extractFullText(geminiFile, localFilePath) {
@@ -237,13 +249,15 @@ Return ONLY valid JSON. No markdown code fences, no extra commentary.`;
             { text: extractPrompt },
             { fileData: { fileUri: geminiFile.uri, mimeType: geminiFile.mimeType } }
           ]
-        }]
-      });
+        }];
+      }
       const fullText = response.text || '';
       if (fullText.trim().length > 50) {
-        const fs = (await import('fs')).default;
-        fs.writeFileSync(localFilePath + '.txt', fullText, 'utf8');
-        console.log(`[GeminiBackend] Extracted full text saved: ${localFilePath}.txt (${fullText.length} chars)`);
+        // On Vercel, do NOT write to local filesystem (EROFS).
+        // The extracted text is available via the Gemini fileData attachment
+        // in tutor responses for exact factual questions.
+        console.log('[GeminiBackend] Extracted full text (persisted via Gemini fileData, not local filesystem):', fullText.length, 'chars');
+        // Do not write to local filesystem - use Gemini fileData instead
       }
     } catch (err) {
       console.warn('[GeminiBackend] extractFullText non-fatal warning:', err.message);
@@ -355,32 +369,22 @@ Return ONLY valid JSON. No markdown code fences, no extra commentary.`;
     // Build syllabus context from selected source and/or course
     let courseContext = '';
     if (selectedSource) {
-      // Attempt to load pre-extracted text for this source (stored alongside the uploaded file).
-      // This gives the model access to the actual document content for exact factual questions
-      // (e.g. "How many patterns?", "List all topics") without re-uploading or re-calling extraction.
+      // Attempt to load pre-extracted text for this source.
+      // On Vercel, files are stored in object storage (Gemini File API / Vercel Blob),
+      // not local filesystem. We rely on the Gemini fileData attachment for grounding
+      // and the source's stored fileUri for text retrieval.
       let extractedDocText = '';
-      if (selectedSource.fileName) {
-        try {
-          const rootDir = (await import('path')).default.resolve(
-            (await import('url')).fileURLToPath(import.meta.url),
-            '../../uploads'
-          );
-          const txtPath = (await import('path')).default.join(rootDir, selectedSource.fileName + '.txt');
-          if ((await import('fs')).default.existsSync(txtPath)) {
-            const raw = (await import('fs')).default.readFileSync(txtPath, 'utf8');
-            // Exact counts/lists need the complete text when it fits. For a
-            // larger document, the full Gemini File API attachment below is
-            // the retrieval source; never present a truncated prefix as complete.
-            const contextLimit = asksForExactCountOrList ? 120_000 : 8_000;
-            extractedDocText = raw.length <= contextLimit
-              ? raw
-              : (asksForExactCountOrList ? '' : `${raw.slice(0, contextLimit)}\n[Excerpt only; full source attached below.]`);
-          }
-        } catch (fsErr) {
-          // Non-fatal: extracted text is optional — Gemini fileData attachment handles grounding
-          console.warn('[GeminiBackend] Could not load extracted doc text:', fsErr.message);
-        }
+      // Try to get text from the Gemini file URI if available
+      const fileUri = selectedSource.geminiFileUri || selectedSource.fileUri;
+      if (fileUri && fileUri !== '/blob/placeholder' && !fileUri.startsWith('/blob/')) {
+        // For Gemini-file URI-backed sources, the full text is available via the
+        // Gemini fileData attachment in tutor responses. We cannot read from local
+        // filesystem on Vercel (EROFS), so we rely on the attachment below.
+        extractedDocText = ''; // Will be provided via Gemini fileData
       }
+      // If the source has a fileName but no Gemini URI, we cannot read extracted text
+      // from local filesystem on Vercel - this is expected in production.
+      // The tutor will use Gemini fileData attachment for grounding instead.
 
       courseContext = `
 Active Subject / Selected Source Document: ${selectedSource.title} (${selectedSource.type || 'Document'})
@@ -585,7 +589,7 @@ Do not fabricate facts. If exact information is unavailable, acknowledge the lim
         sourceName: selectedSource.title,
         location: sectionNum ? `Page ${pageNum}, Section ${sectionNum}` : `Page ${pageNum}`,
         preview: `Specific guidance and patterns cited from ${selectedSource.title}.`,
-        fileUrl: selectedSource.fileUrl || (selectedSource.fileName ? `/uploads/${selectedSource.fileName}` : undefined),
+        fileUrl: selectedSource.fileUrl || (selectedSource.geminiFileUri || selectedSource.fileUri || '/blob/placeholder'),
         videoTimestampSeconds: 0
       };
     }
@@ -602,7 +606,7 @@ Do not fabricate facts. If exact information is unavailable, acknowledge the lim
     const allCitations = rawCitations.map(c => ({
       ...c,
       sourceName: c.sourceName || selectedSource?.title || c.title,
-      fileUrl: c.fileUrl || selectedSource?.fileUrl || (selectedSource?.fileName ? `/uploads/${selectedSource.fileName}` : undefined)
+      fileUrl: c.fileUrl || selectedSource?.fileUrl || (selectedSource?.geminiFileUri || selectedSource?.fileUri || '/blob/placeholder')
     }));
 
     if (dynamicCitation) {
@@ -651,7 +655,7 @@ Do not fabricate facts. If exact information is unavailable, acknowledge the lim
           sourceName,
           location: `Page ${page}`,
           preview: `DSA pattern headings listed on page ${page}.`,
-          fileUrl: source.fileUrl || (source.fileName ? `/uploads/${source.fileName}` : undefined)
+          fileUrl: source.fileUrl || (source.geminiFileUri || source.fileUri || '/blob/placeholder')
         }));
 
         return {

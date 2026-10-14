@@ -37,9 +37,10 @@ export default function MultimodalUpload({
   const [targetFileType, setTargetFileType] = useState('textbook');
 
   const fileInputRef = useRef(null);
+  const [blobUrl, setBlobUrl] = useState('');
 
   // Trigger file picker for specific media type
-  const triggerPicker = (type) => {
+  const triggerPicker = async (type) => {
     setTargetFileType(type);
     setUploadError(null);
     setUploadSuccess(null);
@@ -56,7 +57,24 @@ export default function MultimodalUpload({
     }
   };
 
-  // Handle real file ingestion
+  // Generate a signed Vercel Blob upload URL
+  const generateBlobUploadUrl = async () => {
+    try {
+      const res = await fetch('/api/blob-upload-url');
+      const data = await res.json();
+      if (data.ok && data.blobUrl) {
+        setBlobUrl(data.blobUrl);
+        return data.blobUrl;
+      }
+      throw new Error('Failed to generate Blob upload URL');
+    } catch (err) {
+      console.error('[MultimodalUpload] Blob upload URL error:', err);
+      setUploadError('Failed to prepare upload. Please try again.');
+      return null;
+    }
+  };
+
+  // Handle real file ingestion - using direct Vercel Blob upload
   const handleFileChange = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -76,54 +94,87 @@ export default function MultimodalUpload({
     setUploadProgress(15);
     setUploadStage(isHindi 
       ? `"${file.name}" अपलोड किया जा रहा है...` 
-      : `Uploading "${file.name}" to multimodal ingestion pipeline...`);
+      : `Uploading "${file.name}" to Vercel Blob storage...`);
 
-    let progressTimer1;
-    let progressTimer2;
+    // Generate signed Blob upload URL
+    const signedBlobUrl = await generateBlobUploadUrl();
+    if (!signedBlobUrl) {
+      setIsUploading(false);
+      return;
+    }
 
+    // Upload file directly to Vercel Blob from the browser
+    // This bypasses server function payload limits - the transfer goes
+    // directly from browser to Vercel's edge storage
     try {
-      progressTimer1 = setTimeout(() => {
-        setUploadProgress(45);
-        setUploadStage(targetFileType === 'video'
-          ? (isHindi ? 'जेमिनी वीडियो फ्रेम और टाइमस्टैम्प संसाधित किए जा रहे हैं...' : 'Processing Gemini multimodal video frames & speech timestamps...')
-          : (isHindi ? 'जेमिनी विज़न और दस्तावेज़ लेआउट का विश्लेषण किया जा रहा है...' : 'Extracting document layout, formulas & visual coordinates via Gemini...'));
-      }, 600);
+      const fetchModule = await import('fetch');
+      const fetch = fetchModule.default || fetchModule.fetch;
+      
+      // Use the Vercel Blob upload API with the signed URL
+      // The signed URL from /api/blob-upload-url includes the token and path
+      const response = await fetch(signedBlobUrl, {
+        method: 'PUT',
+        body: file,
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream'
+        }
+      });
 
-      progressTimer2 = setTimeout(() => {
-        setUploadProgress(80);
-        setUploadStage(isHindi 
-          ? 'पाठ्यक्रम ज्ञान ग्राफ में उद्धरण और सूत्र इंडेक्स किए जा रहे हैं...' 
-          : 'Indexing syllabus topics & exact page/slide citations into knowledge graph...');
-      }, 1500);
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`Vercel Blob upload failed: ${response.status} - ${errorText}`);
+      }
 
-      const response = await GeminiService.uploadSourceFile({
-        file,
-        courseId: activeCourse?.id,
-        fileType: targetFileType
+      // Blob upload succeeded - now call the backend API with the Blob URL + metadata
+      setUploadProgress(20);
+      setUploadStage(isHindi 
+        ? 'बैकएंड पर संसाधन प्रसंस्करण शुरू हो रहा है...' 
+        : 'Blob uploaded, starting backend processing...');
+
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          blobUrl: signedBlobUrl,
+          courseId: activeCourse?.id,
+          fileType: targetFileType,
+          originalName: file.name,
+          mimeType: file.type || 'application/octet-stream'
+        })
       });
 
       clearTimeout(progressTimer1);
       clearTimeout(progressTimer2);
 
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData?.error || `Backend processing failed with status ${response.status}`);
+      }
+
+      const backendResponse = await response.json();
+
       setUploadProgress(100);
       setUploadStage(isHindi ? 'सफल! स्रोत ज्ञानकोश में शामिल किया गया।' : 'Completed! Source indexed.');
 
-      if (response?.source) {
+      if (backendResponse?.source) {
         if (onAddSource) {
-          onAddSource(response.source);
+          onAddSource(backendResponse.source);
         }
         if (onSelectSource) {
-          onSelectSource(response.source);
+          onSelectSource(backendResponse.source);
         }
         setUploadSuccess(isHindi 
-          ? `सफलतापूर्वक शामिल किया गया: ${response.source.title}` 
-          : `Successfully indexed: ${response.source.title} (${response.source.pages ? `${response.source.pages} Pages` : response.source.slides ? `${response.source.slides} Slides` : response.source.duration || 'Media'})`);
+          ? `सफलतापूर्वक शामिल किया गया: ${backendResponse.source.title}` 
+          : `Successfully indexed: ${backendResponse.source.title} (${backendResponse.source.pages ? `${backendResponse.source.pages} Pages` : backendResponse.source.slides ? `${backendResponse.source.slides} Slides` : backendResponse.source.duration || 'Media'})`);
       }
 
       setTimeout(() => {
         setIsUploading(false);
         setUploadProgress(0);
         setUploadStage('');
+        setBlobUrl('');
       }, 1200);
 
     } catch (err) {

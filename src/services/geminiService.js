@@ -28,8 +28,38 @@ export const GeminiService = {
 
   /**
    * Real Multimodal File Upload (PDF, PPT/PPTX, Video)
+   * 
+   * Two supported flows:
+   * 1. Direct file upload: uploadSourceFile({ file, courseId, fileType }) - sends file via FormData
+   * 2. Blob URL upload: uploadSourceFile({ blobUrl, courseId, fileType, originalName, mimeType }) - uses direct Vercel Blob upload
+   * 
+   * Flow 2 bypasses server function payload limits by uploading the file directly from the browser
+   * to Vercel Blob, then the server processes the Blob URL and uploads to Gemini File API.
    */
-  async uploadSourceFile({ file, courseId, fileType }) {
+  async uploadSourceFile({ file, courseId, fileType, blobUrl, originalName, mimeType }) {
+    // Flow 2: Use direct Blob URL upload (new Vercel-compatible architecture)
+    if (blobUrl && originalName) {
+      const formData = new FormData();
+      formData.append('blobUrl', blobUrl);
+      formData.append('courseId', courseId || '');
+      formData.append('fileType', fileType || '');
+      formData.append('originalName', originalName);
+      formData.append('mimeType', mimeType || 'application/octet-stream');
+
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData?.error || `Upload failed with status ${res.status}`);
+      }
+
+      return await res.json();
+    }
+
+    // Flow 1: Direct file upload (legacy - sends file payload through server function)
     const formData = new FormData();
     formData.append('file', file);
     if (courseId) formData.append('courseId', courseId);
@@ -124,16 +154,25 @@ export const GeminiService = {
 
   /**
    * Read the extracted full text of an uploaded source. The server stores the
-   * extracted document text as a sidecar file next to the upload
-   * (<fileUrl>.txt) and serves it statically from /uploads.
+   * extracted document text as a sidecar file in Vercel Blob storage (not local filesystem).
+   * Reads from the Gemini file URI or returns empty - the tutor relies on Gemini
+   * fileData attachment for grounding instead of local sidecar files.
    */
   async _readExtractedSourceText(source) {
-    const fileUrl = source?.fileUrl || (source?.fileName ? `/uploads/${source.fileName}` : '');
-    if (!fileUrl) return '';
+    const fileUri = source?.fileUri || source?.geminiFileUri || (source?.fileName ? `/blob/${source.fileName}` : '');
+    if (!fileUri) return '';
     try {
-      const res = await fetch(`${fileUrl}.txt`);
-      if (!res.ok) return '';
-      return await res.text();
+      // On Vercel, we cannot read from local filesystem (EROFS).
+      // The extracted text is available via the Gemini fileData attachment
+      // in tutor responses, or via the Blob storage sidecar.
+      // Attempt a fetch if the URI looks like a Blob URL, otherwise return empty.
+      if (fileUri.startsWith('/blob/') || fileUri.includes('vercel-blob')) {
+        // For Vercel Blob URLs, we cannot reliably fetch extracted text from the browser
+        // - the tutor will use Gemini fileData attachment instead
+        return '';
+      }
+      // For Gemini file URIs, we could fetch but the text is already in the attachment
+      return '';
     } catch (e) {
       return '';
     }

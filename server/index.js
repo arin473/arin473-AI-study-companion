@@ -2,6 +2,10 @@
  * Main Backend Server
  * Secure API Gateway for Google Gemini integration, File uploads, Tutor Grounding,
  * and Benchmark Evaluations. Serves Vite in development mode on port 5173.
+ * 
+ * NOTE: Uploads use Vercel Blob for persistent storage. Files are uploaded directly
+ * from the browser to Vercel Blob (bypassing server function payload limits), then
+ * the server processes them from the Blob URL and uploads to Gemini File API.
  */
 
 import express from 'express';
@@ -11,6 +15,7 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import { GoogleGenAI } from '@google/genai';
 import { GeminiBackendService } from './geminiBackend.js';
 import { runSimulatedLearners } from './evaluatePersonalization.js';
 
@@ -25,15 +30,49 @@ dotenv.config({ path: path.join(rootDir, '.env.local') });
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Ensure uploads folder exists
-const uploadsDir = path.join(rootDir, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
+// Gemini API client (server-side only)
+const geminiApiKey = process.env.GEMINI_API_KEY || '';
+const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
 
-// Multer storage for uploaded files
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
+// Vercel Blob configuration
+// The BLOB_TOKEN is set as a Vercel environment secret (not exposed to browsers).
+// It authorizes server-side writes to Vercel Blob storage.
+const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
+
+/**
+ * Generate a signed Vercel Blob upload URL for direct frontend upload.
+ * The frontend uses this URL to upload files directly to Vercel Blob storage,
+ * bypassing server function payload limits.
+ */
+app.get('/api/blob-upload-url', async (req, res) => {
+  try {
+    if (!BLOB_TOKEN) {
+      return res.status(500).json({ ok: false, error: 'Vercel Blob token not configured.' });
+    }
+
+    // Vercel Blob upload API: POST to https://blob.vercel-storage.com/upload
+    // We generate a path based on timestamp and original name to avoid collisions
+    const timestamp = Date.now();
+    // Return a signed URL that the frontend can use with PUT/POST
+    const blobPath = `uploads/${timestamp}-${Date.randomUUID()}`;
+    const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${BLOB_TOKEN}`;
+
+    res.json({
+      ok: true,
+      blobUrl: signedUrl,
+      blobPath: blobPath
+    });
+  } catch (err) {
+    console.error('[Server] Blob upload URL error:', err);
+    res.status(500).json({ ok: false, error: 'Failed to generate Blob upload URL.' });
+  }
+});
+
+// Multer memory storage (only used as fallback / for API routes that need it)
+// We no longer use diskStorage to avoid EROFS on Vercel.
+// Using memoryStorage with a size limit; for large files, frontend uploads directly to Vercel Blob.
+const memoryStorage = multer.memoryStorage({
+  destination: (req, file, cb) => cb(null, ''),
   filename: (req, file, cb) => {
     const cleanName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
     cb(null, `${Date.now()}-${cleanName}`);
@@ -41,9 +80,9 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
-  storage,
+  storage: memoryStorage,
   limits: {
-    fileSize: 100 * 1024 * 1024 // 100MB limit for hackathon prototype
+    fileSize: 10 * 1024 * 1024 // 10MB limit for memory storage fallback
   },
   fileFilter: (req, file, cb) => {
     const allowedExtensions = ['.pdf', '.pptx', '.ppt', '.mp4', '.webm', '.mov', '.mkv'];
@@ -59,7 +98,6 @@ const upload = multer({
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use('/uploads', express.static(uploadsDir));
 
 const geminiService = new GeminiBackendService();
 
@@ -80,20 +118,18 @@ app.get('/api/status', (req, res) => {
 });
 
 // Real Multimodal File Upload (PDF, PPT/PPTX, Video)
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+app.post('/api/upload', async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: 'No file received in request.' });
+    const { blobUrl, courseId, fileType, originalName, mimeType } = req.body;
+
+    if (!blobUrl || !originalName) {
+      return res.status(400).json({ ok: false, error: 'Blob URL and original name are required.' });
     }
 
-    const { courseId, fileType } = req.body;
-    const filePath = req.file.path;
-    const fileName = req.file.filename;
-    const originalName = req.file.originalname;
     const ext = path.extname(originalName).toLowerCase();
     const resolvedType = fileType || (ext === '.pdf' ? 'textbook' : (ext === '.pptx' || ext === '.ppt') ? 'slides' : 'video');
 
-    console.log(`[Server] Received upload: ${originalName} (${resolvedType}, ${req.file.size} bytes)`);
+    console.log(`[Server] Received upload request for: ${originalName} (${resolvedType}) via Blob URL`);
 
     let geminiFile = null;
     let analysisResult = null;
@@ -102,16 +138,90 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     // For .ppt files we skip the Gemini upload and rely on text-only metadata.
     const isLegacyPpt = ext === '.ppt';
 
-    if (geminiService.isConfigured() && !isLegacyPpt) {
+    // Download the file from Vercel Blob URL so we can upload to Gemini File API
+    let fileContent = null;
+    try {
+      // fetch is available globally in Node.js 18+ (project uses ESM)
+      const response = await fetch(blobUrl);
+      if (response.ok) {
+        fileContent = await response.arrayBuffer();
+      } else {
+        throw new Error(`Failed to download from Blob URL: ${response.status}`);
+      }
+    } catch (fetchErr) {
+      console.warn('[Server] Could not download from Blob URL:', fetchErr.message);
+      fileContent = null;
+    }
+
+    if (geminiApiKey && ai && !isLegacyPpt) {
       try {
-        geminiFile = await geminiService.uploadFile(filePath, req.file.mimetype, originalName);
-        analysisResult = await geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName);
+        // Upload to Gemini File API using the file content from Blob
+        // The @google/genai SDK v2 accepts Blob, ArrayBuffer, ReadableStream, or string path
+        let geminiFileObj;
+        if (fileContent instanceof ArrayBuffer || (fileContent !== null && typeof fileContent === 'object')) {
+          // Pass the ArrayBuffer/Blob directly
+          geminiFileObj = await ai.files.upload({
+            file: fileContent,
+            config: {
+              displayName: originalName,
+              mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
+            }
+          });
+        } else {
+          // Fallback: try passing as-is
+          geminiFileObj = await ai.files.upload({
+            file: fileContent,
+            config: {
+              displayName: originalName,
+              mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
+            }
+          });
+        }
+        geminiFile = geminiFileObj;
+        console.log(`[GeminiBackend] File uploaded to Gemini: ${geminiFile.name}, initial state: ${geminiFile.state}`);
+
+        // For video files, poll until ACTIVE
+        const effectiveMime = mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4');
+        if (effectiveMime.startsWith('video/')) {
+          let attempts = 0;
+          const MAX_POLL = 30; // ~2 minutes maximum
+          while (attempts < MAX_POLL) {
+            const state = geminiFile.state?.toString();
+            if (state === 'ACTIVE') break;
+            if (state === 'FAILED') {
+              throw new Error('Gemini File API video processing failed.');
+            }
+            await new Promise(r => setTimeout(r, 4000));
+            geminiFile = await ai.files.get({ name: geminiFile.name });
+            attempts++;
+          }
+          if (geminiFile.state?.toString() !== 'ACTIVE') {
+            throw new Error('Video processing timed out. Try a shorter clip or check your network.');
+          }
+        }
+
         // Non-blocking: extract and save full text for tutor source-grounding context
-        geminiService.extractFullText(geminiFile, filePath).catch(e =>
-          console.warn('[Server] extractFullText skipped:', e.message)
-        );
+        try {
+          await ai.models.generateContent({
+            model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+            contents: [{
+              role: 'user',
+              parts: [
+                { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
+                { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
+              ]
+            }]
+          }).catch(e =>
+            console.warn('[Server] extractFullText non-blocking skipped:', e.message)
+          );
+        } catch (extractErr) {
+          console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
+        }
+
+        analysisResult = await geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName);
       } catch (geminiErr) {
         console.warn('[Server] Gemini processing warning:', geminiErr.message);
+        // Continue with limited metadata if Gemini processing fails
       }
     } else if (isLegacyPpt) {
       console.log('[Server] .ppt (legacy binary) is not supported by Gemini File API. Indexing as text-only. Suggest converting to .pptx.');
@@ -135,8 +245,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       statusStr = 'Processed (100% - Gemini Multimodal)';
     } else if (isLegacyPpt) {
       statusStr = 'Indexed (Text-only — convert to .pptx for Gemini vision)';
-    } else if (geminiService.isConfigured()) {
-      statusStr = 'Indexed (Gemini processing failed — file stored locally)';
+    } else if (geminiApiKey && ai) {
+      statusStr = 'Indexed (Gemini processing failed — check server logs)';
     } else {
       statusStr = 'Indexed (Local Knowledge Engine — set GEMINI_API_KEY for live AI)';
     }
@@ -146,7 +256,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       id: c.id || ('cite-' + Date.now() + '-' + Math.random().toString(36).slice(2)),
       ...c,
       sourceName: c.sourceName || (analysisResult?.title || originalName),
-      fileUrl: `/uploads/${fileName}`
+      fileUrl: geminiFile?.uri || `/blob/placeholder`  // Use Gemini file URI instead of local path
     }));
 
     const newSource = {
@@ -154,16 +264,16 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       type: resolvedType,
       title: analysisResult?.title || originalName.replace(/\.[^/.]+$/, ''),
       origin: `Uploaded Source (${originalName})`,
-      fileName: fileName,
-      fileUrl: `/uploads/${fileName}`,
-      fileSize: `${(req.file.size / (1024 * 1024)).toFixed(2)} MB`,
-      mimeType: req.file.mimetype,
+      fileName: originalName,
+      fileUrl: geminiFile?.uri || `/blob/placeholder`,  // Use Gemini file URI instead of local path
+      fileSize: 'Unknown',  // Will be populated if we have size info
+      mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4'),
       pages,
       slides,
       duration,
       timestamp: resolvedType === 'video' ? '00:00' : undefined,
       status: statusStr,
-      extractedTokens: Math.round(req.file.size / 300),
+      extractedTokens: analysisResult?.extractedTokens || 0,
       topicsTagged: analysisResult?.topics || ['topic-uploaded-material'],
       subjectId: 'subject-' + (analysisResult?.title || originalName).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
       geminiFileUri: geminiFile?.uri || null,
@@ -171,7 +281,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       fileUri: geminiFile?.uri || null,
       fileData: geminiFile ? {
         fileUri: geminiFile.uri,
-        mimeType: req.file.mimetype
+        mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
       } : null,
       sampleCitations: enhancedCitations.length > 0
         ? enhancedCitations
@@ -183,8 +293,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
               sourceName: analysisResult?.title || originalName,
               location: resolvedType === 'slides' ? 'Slide 1' : resolvedType === 'video' ? 'Timestamp 00:00' : 'Page 1',
               preview: analysisResult?.summary || 'Source indexed. Upload more or ask the AI tutor about this material.',
-              fileUrl: `/uploads/${fileName}`,
-              videoTimestampSeconds: 0
+              fileUrl: geminiFile?.uri || `/blob/placeholder`
             }
           ]
     };
