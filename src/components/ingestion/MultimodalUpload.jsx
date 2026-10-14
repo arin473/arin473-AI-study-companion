@@ -112,7 +112,7 @@ export default function MultimodalUpload({
       
       // Use the Vercel Blob upload API with the signed URL
       // The signed URL from /api/blob-upload-url includes the token and path
-      const response = await fetch(signedBlobUrl, {
+      const blobResponse = await fetch(signedBlobUrl, {
         method: 'PUT',
         body: file,
         headers: {
@@ -120,9 +120,9 @@ export default function MultimodalUpload({
         }
       });
 
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Vercel Blob upload failed: ${response.status} - ${errorText}`);
+      if (!blobResponse.ok) {
+        const errorText = await blobResponse.text().catch(() => 'Unknown error');
+        throw new Error(`Vercel Blob upload failed: ${blobResponse.status} - ${errorText}`);
       }
 
       // Blob upload succeeded - now call the backend API with the Blob URL + metadata
