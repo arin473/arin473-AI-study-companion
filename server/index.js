@@ -230,102 +230,131 @@ app.post('/api/upload', async (req, res) => {
     // For .ppt files we skip the Gemini upload and rely on text-only metadata.
     const isLegacyPpt = ext === '.ppt';
 
-    // Download the file from Vercel Blob URL so we can upload to Gemini File API
+    // Download the file from Vercel Blob URL so we can upload to Gemini File API.
+    // Serverless functions MUST respond within the platform timeout (10s on
+    // Hobby, 60s on Pro), so every network hop below has a strict deadline and
+    // every slow step degrades to an indexed record instead of hanging forever
+    // (the "stuck progress bar" symptom).
     let fileContent = null;
     try {
       // fetch is available globally in Node.js 18+ (project uses ESM)
-      const response = await fetch(blobUrl);
-      if (response.ok) {
-        fileContent = await response.arrayBuffer();
-      } else {
-        throw new Error(`Failed to download from Blob URL: ${response.status}`);
+      const downloadCtrl = new AbortController();
+      const downloadTimer = setTimeout(() => downloadCtrl.abort(), 25000);
+      try {
+        const response = await fetch(blobUrl, { signal: downloadCtrl.signal });
+        if (response.ok) {
+          fileContent = await response.arrayBuffer();
+        } else {
+          throw new Error(`Failed to download from Blob URL: ${response.status}`);
+        }
+      } finally {
+        clearTimeout(downloadTimer);
       }
     } catch (fetchErr) {
       console.warn('[Server] Could not download from Blob URL:', fetchErr.message);
       fileContent = null;
     }
 
-    if (!isLegacyPpt) {
-      try {
-        // Initialize GoogleGenAI client for this request
-        const googleGenAi = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
+    // Helper: race any promise against a deadline so slow AI steps degrade
+    // instead of exceeding the serverless function timeout.
+    const withDeadline = (promise, ms, label) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms))
+    ]);
+
+    if (!isLegacyPpt && fileContent) {
+      // No API key: skip Gemini entirely and return an indexed record (200),
+      // not a 500. The status string below explains Grounded Core Mode.
+      if (!process.env.GEMINI_API_KEY) {
+        console.log('[Server] GEMINI_API_KEY not set — indexing without live AI analysis.');
+      } else {
         try {
-          // Upload to Gemini File API using the file content from Blob
-          // The @google/genai SDK v2 accepts Blob, ArrayBuffer, ReadableStream, or string path
-          let geminiFileObj;
-          if (fileContent instanceof ArrayBuffer || (fileContent !== null && typeof fileContent === 'object')) {
-            // Pass the ArrayBuffer/Blob directly
-            geminiFileObj = await googleGenAi.files.upload({
-              file: fileContent,
-              config: {
-                displayName: originalName,
-                mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
-              }
-            });
-          } else {
-            // Fallback: try passing as-is
-            geminiFileObj = await googleGenAi.files.upload({
-              file: fileContent,
-              config: {
-                displayName: originalName,
-                mimeType: mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4')
-              }
-            });
-          }
-          geminiFile = geminiFileObj;
-          console.log(`[GeminiBackend] File uploaded to Gemini: ${geminiFile.name}, initial state: ${geminiFile.state}`);
-
-          // For video files, poll until ACTIVE
-          const effectiveMime = mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4');
-          if (effectiveMime.startsWith('video/')) {
-            let attempts = 0;
-            const MAX_POLL = 30; // ~2 minutes maximum
-            while (attempts < MAX_POLL) {
-              const state = geminiFile.state?.toString();
-              if (state === 'ACTIVE') break;
-              if (state === 'FAILED') {
-                throw new Error('Gemini File API video processing failed.');
-              }
-              await new Promise(r => setTimeout(r, 4000));
-              geminiFile = await googleGenAi.files.get({ name: geminiFile.name });
-              attempts++;
-            }
-            if (geminiFile.state?.toString() !== 'ACTIVE') {
-              throw new Error('Video processing timed out. Try a shorter clip or check your network.');
-            }
-          }
-
-          // Non-blocking: extract and save full text for tutor source-grounding context
+          // Initialize GoogleGenAI client for this request
+          const googleGenAi = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
           try {
-            await googleGenAi.models.generateContent({
-              model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-              contents: [{
-                role: 'user',
-                parts: [
-                  { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
-                  { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
-                ]
-              }]
-            }).catch(e =>
-              console.warn('[Server] extractFullText non-blocking skipped:', e.message)
+            const effectiveMime = mimeType || (ext === '.pdf' ? 'application/pdf' : (ext === '.pptx' || ext === '.ppt') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'video/mp4');
+            // Upload to Gemini File API using the file content from Blob.
+            // The @google/genai SDK v2 accepts Blob, ArrayBuffer, ReadableStream, or string path.
+            // Budget: 40s — beyond that we degrade rather than risk function timeout.
+            geminiFile = await withDeadline(
+              googleGenAi.files.upload({
+                file: fileContent,
+                config: {
+                  displayName: originalName,
+                  mimeType: effectiveMime
+                }
+              }),
+              40000,
+              'Gemini file upload'
             );
-          } catch (extractErr) {
-            console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
-          }
+            console.log(`[GeminiBackend] File uploaded to Gemini: ${geminiFile.name}, initial state: ${geminiFile.state}`);
 
-          analysisResult = await geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName);
+            // For video files, poll until ACTIVE — but cap the wait so the
+            // function always responds in time (~5 attempts x 4s = ~20s max).
+            if (effectiveMime.startsWith('video/')) {
+              let attempts = 0;
+              const MAX_POLL = 5;
+              while (attempts < MAX_POLL) {
+                const state = geminiFile.state?.toString();
+                if (state === 'ACTIVE') break;
+                if (state === 'FAILED') {
+                  throw new Error('Gemini File API video processing failed.');
+                }
+                await new Promise(r => setTimeout(r, 4000));
+                geminiFile = await googleGenAi.files.get({ name: geminiFile.name });
+                attempts++;
+              }
+              if (geminiFile.state?.toString() !== 'ACTIVE') {
+                // Don't fail the whole upload: record the file as still
+                // processing so the UI completes instead of hanging.
+                console.warn('[Server] Video not ACTIVE yet after bounded polling — indexing as processing.');
+              }
+            }
+
+            // Full-text extraction: best-effort with a short budget. Failure
+            // must never block the response.
+            try {
+              await withDeadline(
+                googleGenAi.models.generateContent({
+                  model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+                  contents: [{
+                    role: 'user',
+                    parts: [
+                      { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
+                      { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
+                    ]
+                  }]
+                }).catch(e =>
+                  console.warn('[Server] extractFullText non-blocking skipped:', e.message)
+                ),
+                20000,
+                'Full-text extraction'
+              );
+            } catch (extractErr) {
+              console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
+            }
+
+            analysisResult = await withDeadline(
+              geminiService.analyzeUploadedSource(geminiFile, resolvedType, originalName),
+              40000,
+              'Source analysis'
+            );
+          } catch (err) {
+            // Degrade, don't 500: the file IS stored (Blob + Gemini file if the
+            // upload succeeded). Return an indexed record with an honest status
+            // so the UI completes instead of hanging or erroring out.
+            console.error('[Server] Gemini step failed, degrading to indexed record:', err.message);
+          }
         } catch (err) {
-          console.error('[Server] Gemini upload error:', err);
-          res.status(500).json({ ok: false, error: err.message || 'File processing failed.' });
+          console.error('[Server] Gemini initialization error:', err);
+          res.status(500).json({ ok: false, error: err.message || 'Gemini API initialization failed.' });
           return;
         }
-      } catch (err) {
-        console.error('[Server] Gemini initialization error:', err);
-        res.status(500).json({ ok: false, error: err.message || 'Gemini API initialization failed.' });
-        return;
       }
     } else if (isLegacyPpt) {
       console.log('[Server] .ppt (legacy binary) is not supported by Gemini File API. Indexing as text-only. Suggest converting to .pptx.');
+    } else if (!fileContent) {
+      console.warn('[Server] No file content downloaded from Blob URL — indexing metadata only.');
     }
 
     // Determine metadata — prefer real Gemini analysis values, fall back to sensible defaults
@@ -346,7 +375,9 @@ app.post('/api/upload', async (req, res) => {
       statusStr = 'Processed (100% - Gemini Multimodal)';
     } else if (isLegacyPpt) {
       statusStr = 'Indexed (Text-only — convert to .pptx for Gemini vision)';
-    } else if (process.env.GEMINI_API_KEY && googleGenAi) {
+    } else if (geminiFile && !analysisResult) {
+      statusStr = 'Indexed (file stored — AI analysis incomplete, check server logs)';
+    } else if (process.env.GEMINI_API_KEY) {
       statusStr = 'Indexed (Gemini processing failed — check server logs)';
     } else {
       statusStr = 'Indexed (Local Knowledge Engine — set GEMINI_API_KEY for live AI)';

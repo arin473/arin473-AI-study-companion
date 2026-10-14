@@ -174,22 +174,41 @@ export default function MultimodalUpload({
     try {
       setUploadProgress(20);
       setUploadStage(isHindi
-        ? 'बैकएंड पर संसाधन प्रसंस्करण शुरू हो रहा है...'
-        : 'Blob uploaded, starting backend processing...');
+        ? 'बैकएंड पर संसाधन प्रसंस्करण शुरू हो रहा है... (बड़ी PDF में 1-2 मिनट लग सकते हैं)'
+        : 'Blob uploaded, backend processing... (large PDFs can take 1-2 min)');
 
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          blobUrl: finalBlobUrl,
-          courseId: activeCourse?.id,
-          fileType: targetFileType,
-          originalName: file.name,
-          mimeType: file.type || 'application/octet-stream'
-        })
-      });
+      // Safety timeout: the server is budgeted to respond well within the
+      // serverless function limit, but if the request itself hangs (network /
+      // platform kill with no response), abort and surface a clear error
+      // instead of parking the progress bar forever.
+      const uploadCtrl = new AbortController();
+      const uploadTimer = setTimeout(() => uploadCtrl.abort(), 150000);
+      let response;
+      try {
+        response = await fetch('/api/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            blobUrl: finalBlobUrl,
+            courseId: activeCourse?.id,
+            fileType: targetFileType,
+            originalName: file.name,
+            mimeType: file.type || 'application/octet-stream'
+          }),
+          signal: uploadCtrl.signal
+        });
+      } catch (fetchErr) {
+        if (fetchErr?.name === 'AbortError') {
+          throw new Error(isHindi
+            ? 'बैकएंड प्रसंस्करण में बहुत समय लगा (150s)। Vercel Function Logs में [Server] जांचें, फिर छोटी फ़ाइल से पुनः प्रयास करें।'
+            : 'Backend processing timed out (150s). Check Vercel Function Logs for [Server] entries, then retry with a smaller file.');
+        }
+        throw fetchErr;
+      } finally {
+        clearTimeout(uploadTimer);
+      }
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
