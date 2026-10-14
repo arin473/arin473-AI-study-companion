@@ -19,11 +19,22 @@ import { GoogleGenAI } from '@google/genai';
 import { GeminiBackendService } from './geminiBackend.js';
 import { runSimulatedLearners } from './evaluatePersonalization.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const rootDir = path.resolve(__dirname, '..');
+// https://vercel.com/docs/functions/environment-variables#environment-variable-syntax
+// VERCEL_BLOB_TOKEN must be set as a Vercel environment secret (not committed to repo).
+// Generate via: vercel blob tokens create <expiry-days>
+// The frontend uses this to generate signed upload URLs at /api/blob-upload-url.
+// Without this, the app cannot upload files to persistent storage on Vercel.
+const requiredEnvVars = ['GEMINI_API_KEY', 'VERCEL_BLOB_TOKEN'];
 
-// Load environment variables
+for (const varName of requiredEnvVars) {
+  if (!process.env[varName]) {
+    console.error(`[Server] Missing required environment variable: ${varName}`);
+    // In production (Vercel), missing env vars cause the function to exit immediately
+    // so the endpoint is never hit with a missing config.
+    process.exit(1);
+  }
+}
+
 dotenv.config({ path: path.join(rootDir, '.env') });
 dotenv.config({ path: path.join(rootDir, '.env.local') });
 
