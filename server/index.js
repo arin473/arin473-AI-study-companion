@@ -15,74 +15,81 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import crypto from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
 import { GeminiBackendService } from './geminiBackend.js';
 import { runSimulatedLearners } from './evaluatePersonalization.js';
 
-// https://vercel.com/docs/functions/environment-variables#environment-variable-syntax
-// VERCEL_BLOB_TOKEN must be set as a Vercel environment secret (not committed to repo).
-// Generate via: vercel blob tokens create <expiry-days>
-// The frontend uses this to generate signed upload URLs at /api/blob-upload-url.
-// Without this, the app cannot upload files to persistent storage on Vercel.
-const requiredEnvVars = ['GEMINI_API_KEY', 'VERCEL_BLOB_TOKEN'];
+// ESM has no __dirname — resolve the project root so dotenv can find .env files.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const rootDir = path.resolve(__dirname, '..');
 
-for (const varName of requiredEnvVars) {
-  if (!process.env[varName]) {
-    console.error(`[Server] Missing required environment variable: ${varName}`);
-    // In production (Vercel), missing env vars cause the function to exit immediately
-    // so the endpoint is never hit with a missing config.
-    process.exit(1);
-  }
-}
-
-// Vercel Blob configuration
-// The BLOB_TOKEN is set as a Vercel environment secret (not exposed to browsers).
-// It authorizes server-side writes to Vercel Blob storage.
-const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
-
+// Load .env files for local development.
+// On Vercel, environment variables are injected directly into process.env by
+// the platform; dotenv does not override existing process.env values by default.
+// This MUST run before any code reads process.env.VERCEL_BLOB_TOKEN below.
 dotenv.config({ path: path.join(rootDir, '.env') });
 dotenv.config({ path: path.join(rootDir, '.env.local') });
 
 const app = express();
 const PORT = process.env.PORT || 301;
 
-// Vercel Blob configuration
-// The BLOB_TOKEN is set as a Vercel environment secret (not exposed to browsers).
-// It authorizes server-side writes to Vercel Blob storage.
+// Vercel Blob token — read from environment (Vercel secret or .env file).
+// Used to generate signed upload URLs for direct browser→Blob uploads.
+// Do NOT expose this to the browser; it authorizes server-side Blob writes.
+// A missing token is handled per-endpoint with a JSON error response —
+// NEVER process.exit(), which would crash the serverless function during
+// initialization and cause Vercel to return an HTML 500 error page
+// (the exact "Unexpected token '<', \"<!DOCTYPE" symptom on the frontend).
 const BLOB_TOKEN = process.env.VERCEL_BLOB_TOKEN || '';
 
 /**
  * Generate a signed Vercel Blob upload URL for direct frontend upload.
  * The frontend uses this URL to upload files directly to Vercel Blob storage,
  * bypassing server function payload limits.
+ *
+ * Always returns JSON on both success and failure — never an HTML error page.
+ * Supports PDF (application/pdf), video (video/*), and slides
+ * (application/vnd.openxmlformats-officedocument.presentationml.presentation)
+ * — the file type is determined by the frontend at upload time, not here.
  */
 app.get('/api/blob-upload-url', async (req, res) => {
   try {
-    // Ensure required env vars are present - Vercel will exit the function
-    // if they're missing, so we should never hit this path without them in prod.
-    // But we guard anyway to return proper JSON instead of a 500 HTML error.
-    if (!process.env.VERCEL_BLOB_TOKEN) {
-      return res.status(500).json({ ok: false, error: 'Vercel Blob token not configured.' });
+    // Missing token → return JSON (not an HTML 500 page). The frontend
+    // surfaces a clear error instead of a JSON parse failure.
+    if (!BLOB_TOKEN) {
+      console.error('[Server] /api/blob-upload-url: VERCEL_BLOB_TOKEN is not set in the environment.');
+      return res.status(500).json({
+        ok: false,
+        error: 'Vercel Blob token is not configured. Set VERCEL_BLOB_TOKEN as a Vercel environment variable (generate via: vercel blob tokens create <expiry-days>).'
+      });
     }
 
-    // Generate a unique path for the Blob upload using a safe UUID fallback.
-    // Date.randomUUID() is Node.js 20+; fall back to a deterministic string
-    // so the endpoint never throws due to runtime version differences.
+    // Generate a unique path for the Blob upload.
+    // crypto is imported from node:crypto (available Node.js 14.17+).
     let blobPath;
     try {
       blobPath = `uploads/${Date.now()}-${crypto.randomUUID()}`;
-    } catch {
+    } catch (uuidErr) {
+      console.warn('[Server] crypto.randomUUID() failed, using fallback UUID:', uuidErr.message);
       blobPath = `uploads/${Date.now()}-${Math.random().toString(36).slice(2, 20)}`;
     }
 
-    const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${process.env.VERCEL_BLOB_TOKEN}`;
+    // Vercel Blob upload endpoint. The browser PUTs the file directly to
+    // this URL; the token in the query string authorizes the write.
+    const signedUrl = `https://blob.vercel-storage.com/upload?path=${encodeURIComponent(blobPath)}&token=${BLOB_TOKEN}`;
 
-    // Always return valid JSON — never allow an HTML 500 page to leak to the frontend.
-    res.json({ ok: true, blobUrl: signedUrl, blobPath });
+    console.log(`[Server] Generated Blob upload URL for path: ${blobPath}`);
+    return res.json({ ok: true, blobUrl: signedUrl, blobPath });
   } catch (err) {
-    // Never return an HTML error page. Always return JSON.
-    console.error('[Server] Blob upload URL unexpected error:', err);
-    res.status(500).json({ ok: false, error: 'Failed to generate Blob upload URL.' });
+    // NEVER return an HTML error page. Always return JSON so the frontend
+    // can parse the response and surface the real error message.
+    console.error('[Server] /api/blob-upload-url unexpected error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: `Failed to generate Blob upload URL: ${err.message || 'Unknown error'}`
+    });
   }
 });
 
@@ -231,9 +238,10 @@ app.post('/api/upload', async (req, res) => {
                   { text: 'Extract and return the complete full text content of this document exactly as it appears, preserving all headings, lists, tables, and numbering. Do not summarize. Return only the plain text content.' },
                   { fileData: { fileUri: geminiFile.uri, mimeType: effectiveMime } }
                 ]
-              }]).catch(e =>
-                console.warn('[Server] extractFullText non-blocking skipped:', e.message)
-              );
+              }]
+            }).catch(e =>
+              console.warn('[Server] extractFullText non-blocking skipped:', e.message)
+            );
           } catch (extractErr) {
             console.warn('[Server] extractFullText non-blocking warning:', extractErr.message);
           }

@@ -249,8 +249,8 @@ Return ONLY valid JSON. No markdown code fences, no extra commentary.`;
             { text: extractPrompt },
             { fileData: { fileUri: geminiFile.uri, mimeType: geminiFile.mimeType } }
           ]
-        }];
-      }
+        }]
+      });
       const fullText = response.text || '';
       if (fullText.trim().length > 50) {
         // On Vercel, do NOT write to local filesystem (EROFS).
